@@ -1,0 +1,106 @@
+# DifIISR M3FD红外数据集训练配置
+
+exp_name: DifIISR_M3FD_IR
+
+model:
+  target: models.unet.UNetModelSwin
+  ckpt_path: ~  # 从头训练，不加载预训练权重
+  params:
+    image_size: 64
+    in_channels: 6      # 3(噪声) + 3(LQ条件)
+    model_channels: 160
+    out_channels: 3
+    cond_lq: True
+    attention_resolutions: [64,32,16,8]
+    dropout: 0
+    channel_mult: [1, 2, 2, 4]
+    num_res_blocks: [2, 2, 2, 2]
+    conv_resample: True
+    dims: 2
+    use_fp16: False
+    num_head_channels: 32
+    use_scale_shift_norm: True
+    resblock_updown: False
+    swin_depth: 2
+    swin_embed_dim: 192
+    window_size: 8
+    mlp_ratio: 4
+
+diffusion:
+  target: models.script_util.create_gaussian_diffusion_test
+  params:
+    sf: 4
+    schedule_name: exponential
+    schedule_kwargs:
+      power: 0.3
+    etas_end: 0.99
+    steps: 15
+    min_noise_level: 0.04
+    kappa: 2.0
+    weighted_mse: False
+    predict_type: xstart
+    timestep_respacing: ~
+    scale_factor: 1.0
+    normalize_input: True
+    latent_flag: True
+
+autoencoder:
+  target: ldm.models.autoencoder.VQModelTorch
+  ckpt_path: weights/autoencoder_vq_f4.pth
+  use_fp16: True
+  params:
+    embed_dim: 3
+    n_embed: 8192
+    ddconfig:
+      double_z: False
+      z_channels: 3
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult:
+      - 1
+      - 2
+      - 4
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+      padding_mode: zeros
+
+data:
+  train:
+    hr_dir: /home/lch/sr_recons/dataset/M3FD_processed/train/HR
+    lr_dir: /home/lch/sr_recons/dataset/M3FD_processed/train/LR
+    gt_size: 256
+    scale: 4
+    use_hflip: True
+    use_rot: True
+    length: ~  # 使用全部数据
+  val:
+    hr_dir: /home/lch/sr_recons/dataset/M3FD_processed/val/HR
+    lr_dir: /home/lch/sr_recons/dataset/M3FD_processed/val/LR
+    length: 100  # 验证时只用100张
+
+train:
+  output_dir: /home/lch/sr_recons/experiments
+  batch_size: 8         # 根据显存调整
+  val_batch_size: 4
+  lr: 5e-5
+  weight_decay: 0.01
+  iterations: 100000    # 总迭代次数
+  min_lr: 1e-6
+
+  # EMA
+  use_ema: True
+  ema_rate: 0.999
+
+  # 学习率调度
+  use_scheduler: True
+
+  # 日志和保存
+  log_freq: 100         # 每100步记录日志
+  val_freq: 200         # 每200步验证（计算PSNR/SSIM）
+  save_freq: 10000      # 每10000步保存检查点
+
+  # 数据加载
+  num_workers: 4

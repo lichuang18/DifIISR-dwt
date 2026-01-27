@@ -673,14 +673,23 @@ class GaussianDiffusion:
             if no_grad:
                 with th.no_grad():
                     z_sample = 1 / self.scale_factor * z_sample
-                    z_sample = z_sample.type(next(first_stage_model.parameters()).dtype)
+                    # 检查模型是否有参数（DWT没有参数）
+                    try:
+                        model_dtype = next(first_stage_model.parameters()).dtype
+                        z_sample = z_sample.type(model_dtype)
+                    except StopIteration:
+                        pass
                     out = first_stage_model.decode(z_sample)
             else:
                 z_sample = 1 / self.scale_factor * z_sample
-                z_sample = z_sample.type(next(first_stage_model.parameters()).dtype)
+                try:
+                    model_dtype = next(first_stage_model.parameters()).dtype
+                    z_sample = z_sample.type(model_dtype)
+                except StopIteration:
+                    pass
                 out = first_stage_model.decode(z_sample, grad_forward=True)
             return out.type(ori_dtype)
-        
+
     def encode_first_stage(self, y, first_stage_model, up_sample=False):
         ori_dtype = y.dtype
         if up_sample:
@@ -689,7 +698,13 @@ class GaussianDiffusion:
             return y
         else:
             with th.no_grad():
-                y = y.type(dtype=next(first_stage_model.parameters()).dtype)
+                # 检查模型是否有参数（DWT没有参数）
+                try:
+                    model_dtype = next(first_stage_model.parameters()).dtype
+                    y = y.type(dtype=model_dtype)
+                except StopIteration:
+                    # 模型没有参数（如DWT），保持原始dtype
+                    pass
                 z_y = first_stage_model.encode(y)
                 # z_y = F.interpolate(z_y, scale_factor=4, mode='bicubic')
                 out = z_y * self.scale_factor

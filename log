@@ -1,0 +1,36 @@
+Using device: cuda
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/functional.py:504: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3526.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Loading model from weights/db2.pth...
+Processing 20 images...
+Inference:   0%|                                       | 0/20 [00:00<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 250, in <module>
+    main()
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 202, in main
+    sr_img = inference_single(model, diffusion, autoencoder, lr_img, device, configs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 143, in inference_single
+    sr_tensor = diffusion.ddim_sample_loop(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1041, in ddim_sample_loop
+    for sample in self.ddim_sample_loop_progressive(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1101, in ddim_sample_loop_progressive
+    out = self.ddim_sample(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1000, in ddim_sample
+    out = self.p_mean_variance(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 44, in p_mean_variance
+    return super().p_mean_variance(self._wrap_model(model), *args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 264, in p_mean_variance
+    model_output = model(self._scale_input(x_t, t), t, **model_kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 63, in __call__
+    return self.model(x, new_ts, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/unet.py", line 849, in forward
+    x = th.cat([x, lq], dim=1)
+RuntimeError: Sizes of tensors must match except in dimension 1. Expected size 194 but got size 768 for tensor number 1 in the list.
