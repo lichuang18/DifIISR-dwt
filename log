@@ -1,36 +1,82 @@
-Using device: cuda
+2026-01-27 19:33:55,349 - INFO - Output dir: /home/lch/sr_recons/experiments/DifIISR_DWT_AllBands_20260127_193355
+2026-01-27 19:33:55,350 - INFO - Building models...
 /home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
   warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
 /home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/functional.py:504: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3526.)
   return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
-Loading model from weights/db2.pth...
-Processing 20 images...
-Inference:   0%|                                       | 0/20 [00:00<?, ?it/s]
+2026-01-27 19:33:57,978 - INFO - Using AutoEncoder without pretrained weights (e.g., DWT)
+2026-01-27 19:33:57,980 - INFO - Model parameters: 118.67M
+2026-01-27 19:33:58,001 - INFO - Using EMA
+2026-01-27 19:33:58,003 - INFO - Building dataloaders...
+[DegradationDatasetFromPatches] Loaded 2000 patches from /home/lch/sr_recons/dataset/M3FD_processed/train/HR
+[DegradationDatasetFromPatches] Scale: 4
+[DegradationDatasetFromPatches] Using Real-ESRGAN degradation
+[ValDegradationDataset] Loaded 20 images from /home/lch/sr_recons/dataset/M3FD_processed/val/HR
+2026-01-27 19:33:59,959 - INFO - Train samples: 2000, Val samples: 20
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Downloading: "https://download.pytorch.org/models/vgg16-397923af.pth" to /home/lch/.cache/torch/hub/checkpoints/vgg16-397923af.pth
 Traceback (most recent call last):
-  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 250, in <module>
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 1348, in do_open
+    h.request(req.get_method(), req.selector, req.data, headers,
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 1283, in request
+    self._send_request(method, url, body, headers, encode_chunked)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 1329, in _send_request
+    self.endheaders(body, encode_chunked=encode_chunked)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 1278, in endheaders
+    self._send_output(message_body, encode_chunked=encode_chunked)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 1038, in _send_output
+    self.send(msg)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 976, in send
+    self.connect()
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 1448, in connect
+    super().connect()
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/http/client.py", line 942, in connect
+    self.sock = self._create_connection(
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/socket.py", line 857, in create_connection
+    raise err
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/socket.py", line 845, in create_connection
+    sock.connect(sa)
+ConnectionRefusedError: [Errno 111] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/lch/sr_recons/DifIISR-dwt/train.py", line 542, in <module>
     main()
-  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 202, in main
-    sr_img = inference_single(model, diffusion, autoencoder, lr_img, device, configs)
-  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
-    return func(*args, **kwargs)
-  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 143, in inference_single
-    sr_tensor = diffusion.ddim_sample_loop(
-  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1041, in ddim_sample_loop
-    for sample in self.ddim_sample_loop_progressive(
-  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1101, in ddim_sample_loop_progressive
-    out = self.ddim_sample(
-  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1000, in ddim_sample
-    out = self.p_mean_variance(
-  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 44, in p_mean_variance
-    return super().p_mean_variance(self._wrap_model(model), *args, **kwargs)
-  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 264, in p_mean_variance
-    model_output = model(self._scale_input(x_t, t), t, **model_kwargs)
-  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 63, in __call__
-    return self.model(x, new_ts, **kwargs)
-  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
-    return forward_call(*args, **kwargs)
-  File "/home/lch/sr_recons/DifIISR-dwt/models/unet.py", line 849, in forward
-    x = th.cat([x, lq], dim=1)
-RuntimeError: Sizes of tensors must match except in dimension 1. Expected size 194 but got size 768 for tensor number 1 in the list.
+  File "/home/lch/sr_recons/DifIISR-dwt/train.py", line 450, in main
+    lpips_fn = lpips.LPIPS(net=lpips_net).to(device)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/lpips/lpips.py", line 84, in __init__
+    self.net = net_type(pretrained=not self.pnet_rand, requires_grad=self.pnet_tune)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/lpips/pretrained_networks.py", line 99, in __init__
+    vgg_pretrained_features = tv.vgg16(pretrained=pretrained).features
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py", line 142, in wrapper
+    return fn(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py", line 228, in inner_wrapper
+    return builder(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/vgg.py", line 433, in vgg16
+    return _vgg("D", False, weights, progress, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/vgg.py", line 105, in _vgg
+    model.load_state_dict(weights.get_state_dict(progress=progress, check_hash=True))
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_api.py", line 90, in get_state_dict
+    return load_state_dict_from_url(self.url, *args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/hub.py", line 766, in load_state_dict_from_url
+    download_url_to_file(url, cached_file, hash_prefix, progress=progress)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/hub.py", line 620, in download_url_to_file
+    u = urlopen(req)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 216, in urlopen
+    return opener.open(url, data, timeout)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 519, in open
+    response = self._open(req, data)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 536, in _open
+    result = self._call_chain(self.handle_open, protocol, protocol +
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 496, in _call_chain
+    result = func(*args)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 1391, in https_open
+    return self.do_open(http.client.HTTPSConnection, req,
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/urllib/request.py", line 1351, in do_open
+    raise URLError(err)
+urllib.error.URLError: <urlopen error [Errno 111] Connection refused>

@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import cv2
 
 try:
     import pywt
@@ -326,6 +327,321 @@ class DWTModelSimple(nn.Module):
         self.high_freq_cache = None
 
 
+class DWTModelFullBand(nn.Module):
+    """
+    全子带DWT编解码器 - 方案A
+
+    将所有level2子带(LL+LH+HL+HH)拼接后送入扩散模型
+    让UNet同时增强低频和高频
+
+    编码: 256×256×3 → 64×64×12 (LL2 + LH2 + HL2 + HH2)
+    解码: 64×64×12 → 256×256×3
+
+    注意: level1的高频系数从LR图像获取并缓存，解码时使用
+    """
+    def __init__(self, wavelet='haar', level=2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+        self.hf_level1_cache = None  # 缓存level1高频系数
+
+        if not HAS_PYWT:
+            raise ImportError("pywt is required for DWTModelFullBand. Install with: pip install PyWavelets")
+
+    def encode(self, x):
+        """
+        DWT编码 - 返回全部level2子带拼接
+        输入: x [B, C, H, W] (例如 [B, 3, 256, 256])
+        输出: z [B, C*4, H/4, W/4] (例如 [B, 12, 64, 64])
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        x_np = x.detach().cpu().numpy()
+
+        all_bands_list = []  # 存储所有batch的拼接子带
+        hf_level1_list = []  # 存储level1高频系数
+
+        for b in range(B):
+            channel_bands = []  # 每个通道的子带
+            channel_hf1 = []    # 每个通道的level1高频
+
+            for c in range(C):
+                # 2级DWT分解
+                coeffs = pywt.wavedec2(x_np[b, c], self.wavelet, level=self.level)
+                # coeffs = [LL2, (LH2, HL2, HH2), (LH1, HL1, HH1)]
+
+                LL2 = coeffs[0]           # 64×64
+                LH2, HL2, HH2 = coeffs[1]  # 各64×64
+                LH1, HL1, HH1 = coeffs[2]  # 各128×128 (level1高频)
+
+                # 拼接level2的4个子带
+                channel_bands.append(np.stack([LL2, LH2, HL2, HH2], axis=0))  # [4, 64, 64]
+
+                # 保存level1高频用于解码
+                channel_hf1.append((LH1, HL1, HH1))
+
+            # [C, 4, H/4, W/4] -> [C*4, H/4, W/4]
+            bands = np.concatenate(channel_bands, axis=0)  # [12, 64, 64]
+            all_bands_list.append(bands)
+            hf_level1_list.append(channel_hf1)
+
+        # 缓存level1高频系数
+        self.hf_level1_cache = hf_level1_list
+
+        # [B, 12, 64, 64]
+        z = torch.from_numpy(np.stack(all_bands_list, axis=0)).to(device=device, dtype=dtype)
+        return z
+
+    def decode(self, z):
+        """
+        IDWT解码 - 从全部level2子带重建图像
+        输入: z [B, C*4, H/4, W/4] (例如 [B, 12, 64, 64])
+        输出: x [B, C, H, W] (例如 [B, 3, 256, 256])
+        """
+        B, C_total, H, W = z.shape
+        C = C_total // 4  # 原始通道数
+        device = z.device
+        dtype = z.dtype
+
+        z_np = z.detach().cpu().numpy()
+
+        x_list = []
+        for b in range(B):
+            channel_xs = []
+
+            for c in range(C):
+                # 提取该通道的4个子带
+                idx = c * 4
+                LL2 = z_np[b, idx]
+                LH2 = z_np[b, idx + 1]
+                HL2 = z_np[b, idx + 2]
+                HH2 = z_np[b, idx + 3]
+
+                # 获取level1高频系数
+                if self.hf_level1_cache is not None:
+                    LH1, HL1, HH1 = self.hf_level1_cache[b][c]
+                else:
+                    # 如果没有缓存，用零填充
+                    LH1 = np.zeros((H * 2, W * 2))
+                    HL1 = np.zeros((H * 2, W * 2))
+                    HH1 = np.zeros((H * 2, W * 2))
+
+                # 重建系数列表
+                coeffs = [LL2, (LH2, HL2, HH2), (LH1, HL1, HH1)]
+
+                # 2级IDWT重建
+                x_rec = pywt.waverec2(coeffs, self.wavelet)
+                channel_xs.append(x_rec)
+
+            x_list.append(np.stack(channel_xs, axis=0))
+
+        x = torch.from_numpy(np.stack(x_list, axis=0)).to(device=device, dtype=dtype)
+        return x
+
+    def forward(self, x):
+        """前向传播：编码后解码"""
+        z = self.encode(x)
+        return self.decode(z)
+
+    def clear_cache(self):
+        """清除高频系数缓存"""
+        self.hf_level1_cache = None
+
+
+class DWTModelFullBandTorch(nn.Module):
+    """
+    全子带DWT编解码器 - PyTorch实现版本
+
+    使用纯PyTorch实现，支持GPU加速和梯度传播
+    """
+    def __init__(self, wavelet='haar', level=2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+        self.hf_level1_cache = None
+
+        # 创建DWT和IDWT模块
+        self.dwt = DWTForward(wavelet)
+        self.idwt = DWTInverse(wavelet)
+
+    def encode(self, x):
+        """
+        DWT编码 - 返回全部level2子带拼接
+        输入: x [B, C, H, W]
+        输出: z [B, C*4, H/4, W/4]
+        """
+        # 第一级DWT: H×W → H/2×W/2
+        LL1, (LH1, HL1, HH1) = self.dwt(x)
+
+        # 第二级DWT: H/2×W/2 → H/4×W/4
+        LL2, (LH2, HL2, HH2) = self.dwt(LL1)
+
+        # 缓存level1高频系数用于解码
+        self.hf_level1_cache = (LH1, HL1, HH1)
+
+        # 拼接level2的4个子带: [B, C, H/4, W/4] * 4 -> [B, C*4, H/4, W/4]
+        z = torch.cat([LL2, LH2, HL2, HH2], dim=1)
+
+        return z
+
+    def decode(self, z):
+        """
+        IDWT解码 - 从全部level2子带重建图像
+        输入: z [B, C*4, H/4, W/4]
+        输出: x [B, C, H, W]
+        """
+        B, C_total, H, W = z.shape
+        C = C_total // 4
+
+        # 拆分子带
+        LL2 = z[:, 0:C]
+        LH2 = z[:, C:2*C]
+        HL2 = z[:, 2*C:3*C]
+        HH2 = z[:, 3*C:4*C]
+
+        # 第一级IDWT: H/4×W/4 → H/2×W/2
+        LL1 = self.idwt(LL2, (LH2, HL2, HH2))
+
+        # 获取level1高频系数
+        if self.hf_level1_cache is not None:
+            LH1, HL1, HH1 = self.hf_level1_cache
+        else:
+            # 如果没有缓存，用零填充
+            LH1 = torch.zeros(B, C, H * 2, W * 2, device=z.device, dtype=z.dtype)
+            HL1 = torch.zeros(B, C, H * 2, W * 2, device=z.device, dtype=z.dtype)
+            HH1 = torch.zeros(B, C, H * 2, W * 2, device=z.device, dtype=z.dtype)
+
+        # 第二级IDWT: H/2×W/2 → H×W
+        x = self.idwt(LL1, (LH1, HL1, HH1))
+
+        return x
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z)
+
+    def clear_cache(self):
+        self.hf_level1_cache = None
+
+
+class DWTModelAllBands(nn.Module):
+    """
+    全子带DWT编解码器 - 改进版 (level1 + level2 全部参与扩散)
+
+    将level1和level2的所有子带都送入扩散模型
+    level1子带下采样到与level2相同尺寸，拼接后扩散
+    解码时level1子带上采样回原尺寸
+
+    编码: 256×256×3 → 64×64×21
+        - level2: LL2, LH2, HL2, HH2 (64×64×12)
+        - level1: LH1, HL1, HH1 (128×128×9) → 下采样到 64×64×9
+    解码: 64×64×21 → 256×256×3
+    """
+    def __init__(self, wavelet='haar', level=2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+
+        if not HAS_PYWT:
+            raise ImportError("pywt is required. Install with: pip install PyWavelets")
+
+    def encode(self, x):
+        """
+        DWT编码 - 返回level1+level2全部子带
+        输入: x [B, C, H, W] (例如 [B, 3, 256, 256])
+        输出: z [B, C*7, H/4, W/4] (例如 [B, 21, 64, 64])
+        """
+        B, C, H, W = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        x_np = x.detach().cpu().numpy()
+
+        all_bands_list = []
+
+        for b in range(B):
+            channel_bands = []
+
+            for c in range(C):
+                # 2级DWT分解
+                coeffs = pywt.wavedec2(x_np[b, c], self.wavelet, level=self.level)
+                # coeffs = [LL2, (LH2, HL2, HH2), (LH1, HL1, HH1)]
+
+                LL2 = coeffs[0]           # 64×64
+                LH2, HL2, HH2 = coeffs[1]  # 各64×64
+                LH1, HL1, HH1 = coeffs[2]  # 各128×128
+
+                # level1子带下采样到64×64 (使用平均池化)
+                LH1_down = cv2.resize(LH1, (W//4, H//4), interpolation=cv2.INTER_AREA)
+                HL1_down = cv2.resize(HL1, (W//4, H//4), interpolation=cv2.INTER_AREA)
+                HH1_down = cv2.resize(HH1, (W//4, H//4), interpolation=cv2.INTER_AREA)
+
+                # 拼接7个子带: LL2, LH2, HL2, HH2, LH1, HL1, HH1
+                channel_bands.append(np.stack([LL2, LH2, HL2, HH2, LH1_down, HL1_down, HH1_down], axis=0))
+
+            # [C, 7, H/4, W/4] -> [C*7, H/4, W/4]
+            bands = np.concatenate(channel_bands, axis=0)  # [21, 64, 64]
+            all_bands_list.append(bands)
+
+        # [B, 21, 64, 64]
+        z = torch.from_numpy(np.stack(all_bands_list, axis=0)).to(device=device, dtype=dtype)
+        return z
+
+    def decode(self, z):
+        """
+        IDWT解码 - 从全部子带重建图像
+        输入: z [B, C*7, H/4, W/4] (例如 [B, 21, 64, 64])
+        输出: x [B, C, H, W] (例如 [B, 3, 256, 256])
+        """
+        B, C_total, H, W = z.shape
+        C = C_total // 7  # 原始通道数
+        device = z.device
+        dtype = z.dtype
+
+        z_np = z.detach().cpu().numpy()
+
+        x_list = []
+        for b in range(B):
+            channel_xs = []
+
+            for c in range(C):
+                # 提取该通道的7个子带
+                idx = c * 7
+                LL2 = z_np[b, idx]
+                LH2 = z_np[b, idx + 1]
+                HL2 = z_np[b, idx + 2]
+                HH2 = z_np[b, idx + 3]
+                LH1_down = z_np[b, idx + 4]
+                HL1_down = z_np[b, idx + 5]
+                HH1_down = z_np[b, idx + 6]
+
+                # level1子带上采样回128×128
+                LH1 = cv2.resize(LH1_down, (W*2, H*2), interpolation=cv2.INTER_CUBIC)
+                HL1 = cv2.resize(HL1_down, (W*2, H*2), interpolation=cv2.INTER_CUBIC)
+                HH1 = cv2.resize(HH1_down, (W*2, H*2), interpolation=cv2.INTER_CUBIC)
+
+                # 重建系数列表
+                coeffs = [LL2, (LH2, HL2, HH2), (LH1, HL1, HH1)]
+
+                # 2级IDWT重建
+                x_rec = pywt.waverec2(coeffs, self.wavelet)
+                channel_xs.append(x_rec)
+
+            x_list.append(np.stack(channel_xs, axis=0))
+
+        x = torch.from_numpy(np.stack(x_list, axis=0)).to(device=device, dtype=dtype)
+        return x
+
+    def forward(self, x):
+        z = self.encode(x)
+        return self.decode(z)
+
+    def clear_cache(self):
+        pass  # 此版本不需要缓存
+
+
 # 测试代码
 if __name__ == '__main__':
     # 测试DWT模块
@@ -354,5 +670,32 @@ if __name__ == '__main__':
         print(f"   Latent shape: {z_simple.shape}")
         print(f"   Reconstructed shape: {x_rec_simple.shape}")
         print(f"   Reconstruction error: {(x - x_rec_simple).abs().max():.6f}")
+
+        print("\n3. Testing DWTModelFullBand (Full Subband - Plan A):")
+        model_fullband = DWTModelFullBand(wavelet='haar', level=2)
+        z_fullband = model_fullband.encode(x)
+        x_rec_fullband = model_fullband.decode(z_fullband)
+        print(f"   Input shape: {x.shape}")
+        print(f"   Latent shape: {z_fullband.shape}")  # 应该是 [2, 12, 64, 64]
+        print(f"   Reconstructed shape: {x_rec_fullband.shape}")
+        print(f"   Reconstruction error: {(x - x_rec_fullband).abs().max():.6f}")
+
+        print("\n4. Testing DWTModelFullBandTorch (Full Subband - PyTorch):")
+        model_fullband_torch = DWTModelFullBandTorch(wavelet='haar', level=2)
+        z_fullband_torch = model_fullband_torch.encode(x)
+        x_rec_fullband_torch = model_fullband_torch.decode(z_fullband_torch)
+        print(f"   Input shape: {x.shape}")
+        print(f"   Latent shape: {z_fullband_torch.shape}")
+        print(f"   Reconstructed shape: {x_rec_fullband_torch.shape}")
+        print(f"   Reconstruction error: {(x - x_rec_fullband_torch).abs().max():.6f}")
+
+        print("\n5. Testing DWTModelAllBands (All Bands - level1+level2):")
+        model_allbands = DWTModelAllBands(wavelet='haar', level=2)
+        z_allbands = model_allbands.encode(x)
+        x_rec_allbands = model_allbands.decode(z_allbands)
+        print(f"   Input shape: {x.shape}")
+        print(f"   Latent shape: {z_allbands.shape}")  # 应该是 [2, 21, 64, 64]
+        print(f"   Reconstructed shape: {x_rec_allbands.shape}")
+        print(f"   Reconstruction error: {(x - x_rec_allbands).abs().max():.6f}")
 
     print("\nDWT Model test completed!")

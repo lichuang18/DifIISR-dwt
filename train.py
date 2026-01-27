@@ -30,6 +30,14 @@ from datapipe.paired_dataset import PairedImageDataset, ValPairedImageDataset
 from datapipe.degradation_dataset import DegradationDatasetFromPatches, ValDegradationDataset
 from ldm.modules.ema import LitEma
 
+# 尝试导入LPIPS
+try:
+    import lpips
+    HAS_LPIPS = True
+except ImportError:
+    HAS_LPIPS = False
+    print("Warning: lpips not installed. Perceptual loss will be disabled.")
+
 
 def setup_logger(log_dir):
     """设置日志"""
@@ -180,7 +188,7 @@ def build_dataloader(configs):
     return train_loader, val_loader
 
 
-def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, configs):
+def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, configs, lpips_fn=None):
     """训练一步"""
     model.train()
 
@@ -204,6 +212,25 @@ def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, conf
     )
 
     loss = losses['loss'].mean()
+    lpips_loss_val = 0.0
+
+    # 添加感知损失
+    if lpips_fn is not None and configs.get('perceptual_loss', {}).get('enabled', False):
+        lpips_weight = configs.perceptual_loss.get('lpips_weight', 0.1)
+
+        # 解码预测结果和GT到图像空间
+        with torch.no_grad():
+            z_gt = diffusion.encode_first_stage(gt, autoencoder, up_sample=False)
+
+        # 计算LPIPS (在潜空间或解码后)
+        # 为了效率，我们在潜空间计算（需要先解码）
+        if pred_zstart is not None:
+            pred_img = diffusion.decode_first_stage(pred_zstart, autoencoder)
+            pred_img = pred_img.clamp(-1, 1)
+            gt_norm = gt  # 已经是[-1, 1]
+
+            lpips_loss_val = lpips_fn(pred_img, gt_norm).mean()
+            loss = loss + lpips_weight * lpips_loss_val
 
     # 反向传播
     optimizer.zero_grad()
@@ -214,11 +241,16 @@ def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, conf
 
     optimizer.step()
 
-    return {
+    result = {
         'loss': loss.item(),
         'mse': losses['mse'].mean().item(),
         'grad_norm': grad_norm.item(),
     }
+
+    if lpips_fn is not None:
+        result['lpips'] = lpips_loss_val.item() if isinstance(lpips_loss_val, torch.Tensor) else lpips_loss_val
+
+    return result
 
 
 def calculate_psnr(img1, img2):
@@ -410,6 +442,19 @@ def main():
             ema.load_state_dict(ckpt['ema'])
         start_iter = ckpt['iteration']
 
+    # 构建LPIPS损失函数
+    lpips_fn = None
+    if configs.get('perceptual_loss', {}).get('enabled', False):
+        if HAS_LPIPS:
+            lpips_net = configs.perceptual_loss.get('lpips_net', 'vgg')
+            lpips_fn = lpips.LPIPS(net=lpips_net).to(device)
+            lpips_fn.eval()
+            for param in lpips_fn.parameters():
+                param.requires_grad = False
+            logger.info(f'Using LPIPS perceptual loss with {lpips_net} backbone')
+        else:
+            logger.warning('LPIPS not installed, perceptual loss disabled')
+
     # 训练循环
     logger.info('Starting training...')
     iteration = start_iter
@@ -427,7 +472,7 @@ def main():
 
         # 训练一步
         train_metrics = train_one_step(
-            model, diffusion, autoencoder, batch, optimizer, device, configs
+            model, diffusion, autoencoder, batch, optimizer, device, configs, lpips_fn
         )
 
         # 更新EMA
@@ -444,14 +489,18 @@ def main():
         # 记录日志
         if iteration % int(configs.train.get('log_freq', 100)) == 0:
             lr = optimizer.param_groups[0]['lr']
-            logger.info(
-                f'Iter {iteration}: loss={train_metrics["loss"]:.4f}, '
-                f'mse={train_metrics["mse"]:.4f}, lr={lr:.2e}'
-            )
+            log_msg = f'Iter {iteration}: loss={train_metrics["loss"]:.4f}, mse={train_metrics["mse"]:.4f}'
+            if 'lpips' in train_metrics:
+                log_msg += f', lpips={train_metrics["lpips"]:.4f}'
+            log_msg += f', lr={lr:.2e}'
+            logger.info(log_msg)
+
             writer.add_scalar('train/loss', train_metrics['loss'], iteration)
             writer.add_scalar('train/mse', train_metrics['mse'], iteration)
             writer.add_scalar('train/lr', lr, iteration)
             writer.add_scalar('train/grad_norm', train_metrics['grad_norm'], iteration)
+            if 'lpips' in train_metrics:
+                writer.add_scalar('train/lpips', train_metrics['lpips'], iteration)
 
         # 验证
         if iteration % int(configs.train.get('val_freq', 5000)) == 0:

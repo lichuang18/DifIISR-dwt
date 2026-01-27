@@ -85,20 +85,24 @@ class BaseSampler:
 
         # autoencoder model
         if self.configs.autoencoder is not None:
-            ckpt_path = self.configs.autoencoder.ckpt_path
-            assert ckpt_path is not None, 'Please specify the checkpoint path for the model!'
-            self.write_log(f'Loading AutoEncoder model from {ckpt_path}...')
+            ckpt_path = self.configs.autoencoder.get('ckpt_path', None)
             autoencoder = util_common.instantiate_from_config(self.configs.autoencoder).cuda()
-            
-            ckpt = torch.load(ckpt_path, map_location=f"cuda:{self.rank}")
-            if 'state_dict' in ckpt:
-                util_net.reload_model(autoencoder, ckpt['state_dict'])
+
+            # 只有当ckpt_path存在时才加载权重 (DWT不需要权重)
+            if ckpt_path:
+                self.write_log(f'Loading AutoEncoder model from {ckpt_path}...')
+                ckpt = torch.load(ckpt_path, map_location=f"cuda:{self.rank}")
+                if 'state_dict' in ckpt:
+                    util_net.reload_model(autoencoder, ckpt['state_dict'])
+                else:
+                    util_net.reload_model(autoencoder, ckpt)
             else:
-                util_net.reload_model(autoencoder, ckpt)                
+                self.write_log(f'Using AutoEncoder without pretrained weights (e.g., DWT)')
+
             autoencoder.eval()
             for params in autoencoder.parameters():
                 params.requires_grad = False
-            if self.configs.autoencoder.use_fp16:
+            if self.configs.autoencoder.get('use_fp16', False):
                 self.autoencoder = autoencoder.half()
             else:
                 self.autoencoder = autoencoder

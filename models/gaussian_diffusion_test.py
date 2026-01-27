@@ -639,6 +639,11 @@ class GaussianDiffusion:
             noise = noise[0,].repeat(z_y.shape[0], 1, 1, 1)
         z_sample = self.prior_sample(z_y, noise)
 
+        # 如果使用lq条件，需要用编码后的z_y替换原始lq
+        if model_kwargs is not None and 'lq' in model_kwargs:
+            model_kwargs = dict(model_kwargs)
+            model_kwargs['lq'] = z_y
+
         indices = list(range(self.num_timesteps))[::-1]
         if progress:
             # Lazy import so that we don't depend on tqdm.
@@ -930,8 +935,13 @@ class GaussianDiffusion:
 
         z_t = self.q_sample(z_start, z_y, t, noise=noise)
 
+        # 如果使用lq条件，需要用编码后的z_y替换原始lq
+        if 'lq' in model_kwargs:
+            model_kwargs = dict(model_kwargs)  # 复制避免修改原始dict
+            model_kwargs['lq'] = z_y
+
         terms = {}
-        
+
         model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
         #if self.detection_guidance:
 
@@ -1082,11 +1092,16 @@ class GaussianDiffusion:
         if device is None:
             device = next(model.parameters()).device
         z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
-    
+
         if zT is None:
             z_sample = self.prior_sample(z_y, noise)
         else:
             z_sample = zT
+
+        # 如果使用lq条件，需要用编码后的z_y替换原始lq
+        if model_kwargs is not None and 'lq' in model_kwargs:
+            model_kwargs = dict(model_kwargs)
+            model_kwargs['lq'] = z_y
 
         indices = list(range(self.num_timesteps))[::-1]
         # if progress:
