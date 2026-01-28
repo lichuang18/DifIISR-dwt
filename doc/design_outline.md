@@ -1324,6 +1324,620 @@ level1 (128×128×9) → UNet分支2 (大尺度)
 
 ---
 
-*文档版本: v1.4*
-*更新日期: 2026-01-27*
-*更新内容: AllBands实验结果分析，VAE vs DWT下采样对比，改进方向*
+## 21. 方案深度分析与最终设计 (2026-01-27)
+
+### 21.1 为什么需要下采样？—— VAE/DWT的本质作用
+
+```
+原图 256×256×3 → 潜空间 64×64×3 → 扩散 → 潜空间 64×64×3 → 重建 256×256×3
+                      ↑
+                 缩小4倍
+                 扩散计算量降低16倍！
+```
+
+**核心认识：VAE的核心价值不是"学习特征"，而是"降低扩散计算量"**
+
+### 21.2 方案B（多尺度UNet）的致命问题
+
+```
+方案B设想:
+  level2: 64×64×12   → UNet分支1 (正常)
+  level1: 128×128×9  → UNet分支2 (计算量爆炸！)
+
+UNet计算量与空间尺寸的关系:
+  64×64   → 1×
+  128×128 → 4×
+  256×256 → 16×
+```
+
+| 分支 | 尺寸 | 相对计算量 |
+|------|------|-----------|
+| level2分支 | 64×64 | 1× (~500M MACs) |
+| level1分支 | 128×128 | 4× (~2000M MACs) |
+| **总计** | - | **~2500M MACs** |
+
+**结论：方案B计算量是原VAE方案的4倍，完全不可行！**
+
+### 21.3 各方案综合对比
+
+#### 参数量对比
+
+```
+原VAE编解码器: ~49M参数
+DWT编解码器: 0参数
+方案A额外参数:
+  down_conv: 9 × 9 × 3 × 3 = 729
+  up_convT: 9 × 9 × 4 × 4 = 1296
+  总计: ~2K (可忽略)
+```
+
+| 方案 | 编解码参数 | UNet参数 | 总参数 | 相对VAE |
+|------|-----------|----------|--------|---------|
+| 原VAE | 49M | 118M | 167M | 基准 |
+| DWT-LL | 0 | 118M | 118M | -29% |
+| DWT-FullBand | 0 | 118M | 118M | -29% |
+| DWT-AllBands | 0 | 118.7M | 118.7M | -29% |
+| **方案A** | **2K** | **118.7M** | **118.7M** | **-29%** |
+| ~~方案B~~ | 0 | 150-170M | 150-170M | 不可行 |
+
+#### 计算量对比 (MACs)
+
+```
+原VAE编解码: ~115M MACs
+DWT编解码: ~1.2M MACs
+方案A额外计算:
+  down_conv (128→64): 9×9×3×3×64×64 = ~2.7M MACs
+  up_convT (64→128): 9×9×4×4×128×128 = ~19M MACs
+  总计: ~22M MACs
+```
+
+| 方案 | 编解码MACs | UNet MACs | 总MACs | 相对VAE |
+|------|-----------|-----------|--------|---------|
+| 原VAE | 115M | 500M | 615M | 基准 |
+| DWT-LL | 1.2M | 500M | 501M | -19% |
+| DWT-FullBand | 1.2M | 500M | 501M | -19% |
+| DWT-AllBands | 1.2M | 520M | 521M | -15% |
+| **方案A** | **23M** | **520M** | **543M** | **-12%** |
+| ~~方案B~~ | 1.2M | 2500M | 2500M | +306% ✗ |
+
+#### 综合对比表
+
+| 指标 | 原VAE | DWT-AllBands | 方案A |
+|------|-------|--------------|-------|
+| 编解码参数 | 49M | 0 | 2K |
+| 总参数 | 167M | 118.7M | 118.7M |
+| 编解码MACs | 115M | 1.2M | 23M |
+| 总MACs | 615M | 521M | 543M |
+| 需要预训练权重 | 是(196MB) | 否 | 否 |
+| level1信息损失 | 有(可学习补偿) | 有(固定resize) | 有(可学习减少) |
+| 实现难度 | - | 已完成 | 低 |
+| 预期视觉质量 | 高 | 低 | 中 |
+
+### 21.4 方案A详细设计：可学习上下采样
+
+#### 核心改动
+
+```python
+class DWTModelAllBandsLearnable(nn.Module):
+    """
+    改进版AllBands：用可学习Conv替代cv2.resize
+
+    编码: 256×256×3 → 64×64×21
+      - level2: LL2, LH2, HL2, HH2 (64×64×12) - DWT直接得到
+      - level1: LH1, HL1, HH1 (128×128×9) → Conv下采样 → 64×64×9
+
+    解码: 64×64×21 → 256×256×3
+      - level1: 64×64×9 → ConvTranspose上采样 → 128×128×9
+      - IDWT重建
+    """
+    def __init__(self, wavelet='haar', level=2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+
+        # 可学习的下采样：128→64
+        # 9通道 = 3个RGB通道 × 3个高频子带(LH1, HL1, HH1)
+        self.down = nn.Conv2d(9, 9, kernel_size=3, stride=2, padding=1)
+
+        # 可学习的上采样：64→128
+        self.up = nn.ConvTranspose2d(9, 9, kernel_size=4, stride=2, padding=1)
+
+    def encode(self, x):
+        # DWT分解得到level1和level2子带
+        # ...
+
+        # level1子带：可学习下采样
+        level1_bands = torch.cat([LH1, HL1, HH1], dim=1)  # [B, 9, 128, 128]
+        level1_down = self.down(level1_bands)  # [B, 9, 64, 64]
+
+        # 拼接
+        z = torch.cat([level2_bands, level1_down], dim=1)  # [B, 21, 64, 64]
+        return z
+
+    def decode(self, z):
+        # 拆分
+        level2_bands = z[:, :12]  # [B, 12, 64, 64]
+        level1_down = z[:, 12:]   # [B, 9, 64, 64]
+
+        # level1子带：可学习上采样
+        level1_bands = self.up(level1_down)  # [B, 9, 128, 128]
+
+        # IDWT重建
+        # ...
+```
+
+#### 与cv2.resize的对比
+
+| 特性 | cv2.resize | 可学习Conv |
+|------|------------|-----------|
+| 下采样方式 | 固定INTER_AREA | 学习的3×3卷积 |
+| 上采样方式 | 固定INTER_CUBIC | 学习的4×4反卷积 |
+| 参数量 | 0 | ~2K |
+| 计算量 | ~1M MACs | ~22M MACs |
+| 信息保留 | 无差别丢弃 | 学习保留重要信息 |
+| 细节恢复 | 固定插值 | 学习生成合理细节 |
+
+#### 训练策略
+
+```yaml
+# 配置建议
+train:
+  iterations: 50000-100000  # 需要足够迭代让Conv学习
+  lr: 5e-5
+
+perceptual_loss:
+  enabled: True
+  lpips_weight: 0.1-0.3  # 可适当调大
+```
+
+### 21.5 最终结论
+
+1. **方案B不可行**：128×128分支计算量爆炸，违背DWT替代VAE的初衷
+2. **方案A是唯一合理改进**：用可学习Conv替代cv2.resize，代价极小
+3. **预期效果**：
+   - 可学习下采样能保留更多重要的高频信息
+   - 可学习上采样能生成更合理的细节
+   - 视觉质量应该介于当前AllBands和原VAE之间
+
+### 21.6 下一步行动
+
+- [x] 实现 `DWTModelAllBandsLearnable` 类
+- [x] 创建新配置文件
+- [ ] 训练50K+迭代
+- [ ] 对比评估
+
+---
+
+## 22. 纯PyTorch版本实现与LPIPS梯度修复 (2026-01-28)
+
+### 22.1 问题发现
+
+使用 `DWTModelAllBandsLearnable` 训练时，LPIPS 损失始终不下降（维持在 0.7+），经检查发现**梯度链断开**。
+
+### 22.2 梯度断开的三处位置
+
+| 位置 | 文件:行号 | 问题代码 | 影响 |
+|------|----------|---------|------|
+| 1 | `dwt_autoencoder.py` decode() | `.detach().cpu().numpy()` | decode输出无梯度 |
+| 2 | `gaussian_diffusion_test.py:969` | `pred_zstart = model_output.detach()` | UNet输出被detach |
+| 3 | `train.py:238` | `decode_first_stage()` 默认 `no_grad=True` | decode在no_grad中 |
+
+### 22.3 解决方案
+
+#### (1) 新增 `DWTModelAllBandsLearnableTorch` 类
+
+decode 使用纯 PyTorch 实现的 IDWT，不经过 numpy：
+
+```python
+class DWTModelAllBandsLearnableTorch(nn.Module):
+    def decode(self, z):
+        # 全程PyTorch操作，梯度可回传
+        level1_bands = self.up(level1_down)  # ConvTranspose2d
+        LL1 = self.idwt(LL2, (LH2, HL2, HH2))  # 纯PyTorch IDWT
+        x = self.idwt(LL1, (LH1, HL1, HH1))
+        return x  # 有梯度
+```
+
+#### (2) 修改 `gaussian_diffusion_test.py`
+
+```python
+# 原代码
+pred_zstart = model_output.detach()
+
+# 修改后
+pred_zstart = model_output  # 移除 .detach()
+```
+
+#### (3) 修改 `train.py`
+
+```python
+# 原代码
+pred_img = diffusion.decode_first_stage(pred_zstart, autoencoder)
+
+# 修改后
+pred_img = diffusion.decode_first_stage(pred_zstart, autoencoder, no_grad=False)
+```
+
+#### (4) 修改 `decode_first_stage` 函数
+
+```python
+# 原代码
+out = first_stage_model.decode(z_sample, grad_forward=True)
+
+# 修改后（移除不存在的参数）
+out = first_stage_model.decode(z_sample)
+```
+
+### 22.4 修复后的梯度链路
+
+```
+UNet输出 model_output (有梯度)
+    ↓
+pred_zstart = model_output (不再detach)
+    ↓
+decode_first_stage(no_grad=False)
+    ↓
+DWTModelAllBandsLearnableTorch.decode()
+    ├── self.up() - ConvTranspose2d (有梯度)
+    └── self.idwt() - 纯PyTorch (有梯度)
+    ↓
+pred_img (有梯度)
+    ↓
+lpips_fn(pred_img, gt)
+    ↓
+loss.backward() → 梯度回传到 UNet ✓
+```
+
+### 22.5 新增文件清单
+
+| 文件 | 说明 |
+|------|------|
+| `ldm/models/dwt_autoencoder.py` | 新增 `DWTModelAllBandsLearnableTorch` 类 |
+| `configs/train_m3fd_dwt_learnable_torch.yaml` | 纯PyTorch版本配置 |
+| `test_gradient.py` | 梯度链路验证脚本 |
+
+### 22.6 训练结果 (2600次迭代)
+
+| 指标 | 初始 (100次) | 2600次 | 变化 |
+|------|-------------|--------|------|
+| **MSE** | 0.0179 | 0.0036 | **↓ 80%** ✓ |
+| **LPIPS** | 0.7176 | 0.6951 | ↓ 3% (波动大) |
+| **Total Loss** | 0.0897 | 0.0731 | ↓ 18% |
+
+### 22.7 LPIPS 波动大的原因分析
+
+扩散模型训练时，时间步 `t` 随机采样（0到14）：
+
+| t 值 | pred_zstart 质量 | LPIPS |
+|------|-----------------|-------|
+| t ≈ 0 | 接近真实图像 | 低 |
+| t ≈ 14 | 从噪声预测，质量差 | 高 |
+
+每次迭代 `t` 随机变化，导致 LPIPS 波动剧烈，但**长期趋势是下降的**。
+
+### 22.8 结论
+
+1. **MSE 明显下降** → 模型在正常学习
+2. **LPIPS 有下降趋势** → 梯度回传正常工作
+3. **波动是正常现象** → 由随机时间步 `t` 导致
+4. **建议继续训练** → 50000+ 次迭代后评估效果
+
+### 22.9 版本对比
+
+| 版本 | decode实现 | LPIPS梯度 | 使用场景 |
+|------|-----------|----------|---------|
+| `DWTModelAllBandsLearnable` | pywt (numpy) | ❌ 断开 | 不使用LPIPS |
+| `DWTModelAllBandsLearnableTorch` | 纯PyTorch | ✅ 正常 | **使用LPIPS** |
+
+### 22.10 训练命令
+
+```bash
+cd /home/lch/sr_recons/DifIISR-dwt
+conda activate sr
+
+# 验证梯度
+python test_gradient.py
+
+# 开始训练
+CUDA_VISIBLE_DEVICES=0 python train.py \
+    --config configs/train_m3fd_dwt_learnable_torch.yaml \
+    --seed 42
+```
+
+---
+
+## 23. 动态LPIPS权重策略 (2026-01-28)
+
+### 23.1 问题背景
+
+LPIPS损失在训练过程中波动剧烈，难以收敛。原因是扩散模型的时间步 `t` 随机采样：
+
+| t 范围 | pred_zstart 质量 | LPIPS 信号 |
+|--------|-----------------|------------|
+| t ≈ 0 (低噪声) | 接近真实图像 | **稳定、有意义** |
+| t ≈ T/2 (中等噪声) | 质量中等 | 有一定噪声 |
+| t ≈ T (高噪声) | 从纯噪声预测，质量差 | **噪声大、不稳定** |
+
+### 23.2 解决方案：基于时间步的动态权重
+
+根据时间步 `t` 动态调整LPIPS权重：
+
+```
+T = 15 (总时间步数)
+t1 = T // 3 = 5
+t2 = 2 * T // 3 = 10
+
+权重策略:
+┌─────────────────┬─────────────┬─────────────────────────────┐
+│   时间步范围     │  LPIPS权重   │  原因                        │
+├─────────────────┼─────────────┼─────────────────────────────┤
+│ t < 5  (0-4)    │    1.0      │ pred质量好，信号稳定          │
+│ 5 ≤ t < 10      │    0.1      │ pred质量中等，适度使用        │
+│ t ≥ 10 (10-14)  │    0.001    │ pred质量差，几乎忽略          │
+└─────────────────┴─────────────┴─────────────────────────────┘
+```
+
+### 23.3 代码实现
+
+```python
+# train.py train_one_step() 函数
+
+# 时间步阈值
+T = diffusion.num_timesteps  # 15
+t1 = T // 3      # 5
+t2 = 2 * T // 3  # 10
+
+# 计算每个样本的动态权重
+weights = torch.ones(t.shape[0], device=device)
+weights[(t >= t1) & (t < t2)] = 0.1
+weights[t >= t2] = 0.001
+
+# 计算每个样本的LPIPS
+lpips_per_sample = lpips_fn(pred_img, gt).view(-1)  # [B]
+
+# 加权平均
+weighted_lpips = (lpips_per_sample * weights).mean()
+loss = loss + base_weight * weighted_lpips
+```
+
+### 23.4 预期效果
+
+| 改进点 | 说明 |
+|--------|------|
+| **减少波动** | 高噪声时间步的LPIPS贡献被大幅降低 |
+| **稳定收敛** | 主要学习低噪声时的感知质量 |
+| **保持梯度** | 所有样本都参与计算，梯度更稳定 |
+
+### 23.5 与之前方案的对比
+
+| 方案 | 做法 | 问题 |
+|------|------|------|
+| **旧方案** | 只在 t < T/3 时计算LPIPS，其他时间步跳过 | 2/3的batch没有LPIPS梯度 |
+| **新方案** | 所有时间步都计算，但用不同权重 | 更平滑的梯度信号 |
+
+### 23.6 训练日志分析与lpips_weight调整 (2026-01-28)
+
+#### 问题发现
+
+训练5500次迭代后，日志显示严重问题：
+
+```
+典型日志:
+Iter 2600: loss=0.2890, mse=0.0136, lpips=0.5507
+Iter 2900: loss=0.0356, mse=0.0091, lpips=0.0530
+Iter 4900: loss=0.0270, mse=0.0045, lpips=0.0451
+
+验证结果:
+Validation PSNR: 9.65 dB, SSIM: 0.2881  ← 极低！正常应25-35dB
+```
+
+| 指标 | 最小值 | 最大值 | 波动倍数 |
+|------|--------|--------|----------|
+| loss | 0.0270 | 0.2890 | **10.7x** |
+| mse | 0.0045 | 0.0261 | 5.8x |
+| lpips | 0.0451 | 0.5507 | **12.2x** |
+
+#### 原因分析
+
+**lpips_weight=0.5 太大，LPIPS完全主导了loss：**
+
+```
+loss = mse + 0.5 * lpips
+
+典型贡献:
+- mse贡献: 0.01
+- lpips贡献: 0.5 * 0.3 = 0.15
+
+→ LPIPS贡献是MSE的15倍！
+→ MSE无法正常收敛
+→ PSNR只有9.65dB
+```
+
+#### 动态权重后的LPIPS贡献计算
+
+假设 batch_size=8，时间步均匀分布：
+
+| 时间步区间 | 样本数 | 动态权重 | 典型LPIPS | 加权贡献 |
+|-----------|--------|----------|-----------|----------|
+| t ∈ [0,4] | ~2.67 | 1.0 | 0.07 | 0.07 |
+| t ∈ [5,9] | ~2.67 | 0.1 | 0.22 | 0.022 |
+| t ∈ [10,14] | ~2.67 | 0.001 | 0.47 | 0.0005 |
+
+```
+weighted_lpips ≈ mean(0.07, 0.022, 0.0005) ≈ 0.031
+```
+
+#### 不同 base_weight 的效果对比
+
+| base_weight | LPIPS贡献 | MSE贡献 | LPIPS/MSE | 效果 |
+|-------------|-----------|---------|-----------|------|
+| **0.1** | 0.003 | 0.01 | **0.3** | **MSE主导，LPIPS辅助（推荐）** |
+| 0.2 | 0.006 | 0.01 | 0.6 | 接近平衡 |
+| 0.3 | 0.009 | 0.01 | 0.9 | 接近平衡 |
+| 0.5 | 0.015 | 0.01 | 1.5 | LPIPS主导（问题配置） |
+
+#### 最终配置
+
+```yaml
+# configs/train_m3fd_dwt_learnable_torch.yaml
+perceptual_loss:
+  enabled: True
+  lpips_weight: 0.1    # 从0.5降到0.1
+  lpips_net: 'vgg'
+```
+
+#### 选择 lpips_weight=0.1 的理由
+
+1. **首要目标是让MSE收敛**
+   - 之前PSNR只有9.65dB，模型基本没学好
+   - 需要MSE主导，先学会基本重建
+
+2. **动态权重已经做了主要工作**
+   - 高噪声时间步(t≥10)的LPIPS被压制1000倍
+   - 主要是低噪声时间步的稳定LPIPS在起作用
+
+3. **LPIPS/MSE ≈ 0.3 是合理的辅助比例**
+   - LPIPS不会干扰MSE学习
+   - 但仍能提供感知质量引导
+
+#### 预期改善
+
+| 指标 | 旧配置 (weight=0.5) | 新配置 (weight=0.1) |
+|------|---------------------|---------------------|
+| Loss波动 | 10x | **2~3x** |
+| MSE收敛 | 被LPIPS干扰 | **正常收敛** |
+| 验证PSNR | 9.65dB | **预期25+dB** |
+| 视觉质量 | 不稳定 | 稳定提升 |
+
+#### 后续调整建议
+
+如果训练稳定后（PSNR达到25dB+）想增强视觉质量：
+- 可调高到 `lpips_weight=0.2`（LPIPS/MSE ≈ 0.6）
+- 或在后期微调时调高
+
+---
+
+## 24. 渐进式LPIPS权重调度策略 (2026-01-28)
+
+### 24.1 问题背景
+
+即使使用了动态时间步权重和lpips_weight=0.1，LPIPS贡献仍是MSE的3-6倍：
+
+```
+Iter 400: loss=0.0432, mse=0.0065, lpips=0.3667
+  → LPIPS贡献: 0.1 * 0.3667 = 0.0367
+  → MSE贡献:   0.0065
+  → LPIPS/MSE = 5.6倍  ← LPIPS仍然主导
+```
+
+### 24.2 解决方案：渐进式权重调度
+
+**核心思想**：训练初期让MSE主导学习基本重建，后期逐渐增大LPIPS权重提升视觉质量。
+
+```
+权重调度公式:
+  weight = start + (end - start) * (iteration / total_iterations)
+
+配置:
+  lpips_weight_start: 0.01  (训练初期)
+  lpips_weight_end:   0.15  (训练后期)
+  total_iterations:   100000
+```
+
+### 24.3 权重变化曲线
+
+| 迭代次数 | lpips_weight | 典型LPIPS | LPIPS贡献 | 典型MSE | LPIPS/MSE |
+|----------|--------------|-----------|-----------|---------|-----------|
+| 0K | 0.01 | 0.03 | 0.0003 | 0.010 | **1:33** (MSE主导) |
+| 10K | 0.024 | 0.03 | 0.0007 | 0.008 | 1:11 |
+| 20K | 0.038 | 0.03 | 0.0011 | 0.007 | 1:6 |
+| 30K | 0.052 | 0.03 | 0.0016 | 0.006 | 1:4 |
+| 40K | 0.066 | 0.03 | 0.0020 | 0.006 | 1:3 |
+| 50K | 0.080 | 0.03 | 0.0024 | 0.005 | 1:2 |
+| 60K | 0.094 | 0.03 | 0.0028 | 0.005 | 1:1.8 |
+| 70K | 0.108 | 0.03 | 0.0032 | 0.005 | 1:1.5 |
+| 80K | 0.122 | 0.03 | 0.0037 | 0.005 | 1:1.3 |
+| 90K | 0.136 | 0.03 | 0.0041 | 0.005 | 1:1.2 |
+| 100K | 0.150 | 0.03 | 0.0045 | 0.005 | **1:1** (接近等权) |
+
+*注：典型LPIPS=0.03是经过时间步动态权重加权后的值*
+
+### 24.4 代码实现
+
+#### (1) 新增函数 `get_lpips_weight_schedule()`
+
+```python
+def get_lpips_weight_schedule(iteration, total_iterations, configs):
+    """渐进式LPIPS权重调度"""
+    lpips_config = configs.get('perceptual_loss', {})
+    start_weight = lpips_config.get('lpips_weight_start', 0.01)
+    end_weight = lpips_config.get('lpips_weight_end', 0.15)
+
+    # 线性插值
+    progress = min(iteration / total_iterations, 1.0)
+    weight = start_weight + (end_weight - start_weight) * progress
+
+    return weight
+```
+
+#### (2) 修改 `train_one_step()` 函数
+
+```python
+def train_one_step(..., iteration=0, total_iterations=100000):
+    # 获取渐进式权重
+    base_weight = get_lpips_weight_schedule(iteration, total_iterations, configs)
+
+    # ... 时间步动态权重计算 ...
+
+    loss = loss + base_weight * weighted_lpips
+```
+
+#### (3) 配置文件
+
+```yaml
+perceptual_loss:
+  enabled: True
+  lpips_weight_start: 0.01   # 起始权重
+  lpips_weight_end: 0.15     # 结束权重
+  lpips_net: 'vgg'
+```
+
+### 24.5 日志输出
+
+训练日志现在会显示当前的lpips_weight：
+
+```
+Iter 1000:  loss=0.0320, mse=0.0050, lpips=0.2800, lpips_w=0.0114, lr=5.00e-05
+Iter 50000: loss=0.0280, mse=0.0050, lpips=0.2800, lpips_w=0.0800, lr=2.50e-05
+```
+
+### 24.6 设计优势
+
+| 优势 | 说明 |
+|------|------|
+| **前期稳定** | MSE主导，模型先学会基本重建 |
+| **后期提升** | LPIPS逐渐增大，提升视觉质量 |
+| **平滑过渡** | 线性插值，避免突变 |
+| **可配置** | start/end权重可调整 |
+
+### 24.7 与其他策略的组合
+
+最终的LPIPS权重 = 渐进式权重 × 时间步动态权重
+
+```
+例如 iteration=50000, t=3:
+  渐进式权重 = 0.08
+  时间步权重 = 1.0 (t<5)
+  最终权重 = 0.08 × 1.0 = 0.08
+
+例如 iteration=50000, t=12:
+  渐进式权重 = 0.08
+  时间步权重 = 0.001 (t>=10)
+  最终权重 = 0.08 × 0.001 = 0.00008
+```
+
+---
+
+*文档版本: v1.9*
+*更新日期: 2026-01-28*
+*更新内容: 渐进式LPIPS权重调度策略*

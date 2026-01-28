@@ -692,7 +692,7 @@ class GaussianDiffusion:
                     z_sample = z_sample.type(model_dtype)
                 except StopIteration:
                     pass
-                out = first_stage_model.decode(z_sample, grad_forward=True)
+                out = first_stage_model.decode(z_sample)
             return out.type(ori_dtype)
 
     def encode_first_stage(self, y, first_stage_model, up_sample=False):
@@ -965,14 +965,15 @@ class GaussianDiffusion:
         else:
             raise NotImplementedError(self.loss_type)
 
+        # 注意：这里不使用 detach()，以便 LPIPS 梯度可以回传
         if self.model_mean_type == ModelMeanType.START_X:      # predict x_0
-            pred_zstart = model_output.detach()
+            pred_zstart = model_output  # 移除 .detach()
         elif self.model_mean_type == ModelMeanType.EPSILON:
-            pred_zstart = self._predict_xstart_from_eps(x_t=z_t, y=z_y, t=t, eps=model_output.detach())
+            pred_zstart = self._predict_xstart_from_eps(x_t=z_t, y=z_y, t=t, eps=model_output)
         elif self.model_mean_type == ModelMeanType.RESIDUAL:
-            pred_zstart = self._predict_xstart_from_residual(y=z_y, residual=model_output.detach())
+            pred_zstart = self._predict_xstart_from_residual(y=z_y, residual=model_output)
         elif self.model_mean_type == ModelMeanType.EPSILON_SCALE:
-            pred_zstart = self._predict_xstart_from_eps_scale(x_t=z_t, y=z_y, t=t, eps=model_output.detach())
+            pred_zstart = self._predict_xstart_from_eps_scale(x_t=z_t, y=z_y, t=t, eps=model_output)
         else:
             raise NotImplementedError(self.model_mean_type)
 

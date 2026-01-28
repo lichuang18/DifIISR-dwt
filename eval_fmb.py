@@ -1,5 +1,6 @@
 """
 使用FMB数据集验证DifIISR-DWT模型
+输出 PSNR, SSIM, LPIPS 指标
 """
 
 import os
@@ -9,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import lpips
 from PIL import Image, ImageDraw, ImageFont
 from tqdm import tqdm
 
@@ -55,7 +57,20 @@ def calculate_ssim_color(img1, img2):
     return np.mean(ssim_vals)
 
 
-def create_comparison_image(lr_img, sr_img, hr_img, psnr, ssim, filename):
+def calculate_lpips(img1, img2, lpips_fn, device):
+    """计算LPIPS (输入为numpy数组, 范围[0,1])"""
+    # 转换为tensor, 范围[-1, 1]
+    img1_tensor = torch.from_numpy(img1.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+    img2_tensor = torch.from_numpy(img2.transpose(2, 0, 1)).float().unsqueeze(0).to(device)
+    img1_tensor = img1_tensor * 2 - 1  # [0,1] -> [-1,1]
+    img2_tensor = img2_tensor * 2 - 1
+
+    with torch.no_grad():
+        lpips_val = lpips_fn(img1_tensor, img2_tensor).item()
+    return lpips_val
+
+
+def create_comparison_image(lr_img, sr_img, hr_img, psnr, ssim, lpips_val, filename):
     """创建LR/SR/HR对比图"""
     h, w = hr_img.shape[:2]
     lr_h, lr_w = lr_img.shape[:2]
@@ -187,8 +202,14 @@ def main():
 
     print(f'Processing {len(lr_files)} images...')
 
+    # 初始化LPIPS模型
+    print('Loading LPIPS model...')
+    lpips_fn = lpips.LPIPS(net='vgg').to(device)
+    lpips_fn.eval()
+
     psnr_list = []
     ssim_list = []
+    lpips_list = []
 
     for lr_path in tqdm(lr_files, desc='Inference'):
         # FMB的LR文件名是 00043x4.png，对应HR是 00043.png
@@ -209,6 +230,7 @@ def main():
         # 计算指标
         psnr = 0
         ssim = 0
+        lpips_val = 0
         if hr_path.exists():
             hr_img = np.array(Image.open(hr_path).convert('RGB')).astype(np.float32) / 255.0
 
@@ -216,11 +238,13 @@ def main():
             if sr_img.shape == hr_img.shape:
                 psnr = calculate_psnr(sr_img, hr_img)
                 ssim = calculate_ssim_color(sr_img, hr_img)
+                lpips_val = calculate_lpips(sr_img, hr_img, lpips_fn, device)
                 psnr_list.append(psnr)
                 ssim_list.append(ssim)
+                lpips_list.append(lpips_val)
 
                 # 生成对比图
-                comparison = create_comparison_image(lr_img, sr_img, hr_img, psnr, ssim, lr_path.name)
+                comparison = create_comparison_image(lr_img, sr_img, hr_img, psnr, ssim, lpips_val, lr_path.name)
                 comparison.save(comparison_dir / f'cmp_{lr_path.stem}.png')
             else:
                 print(f'Size mismatch: SR {sr_img.shape} vs HR {hr_img.shape}')
@@ -231,19 +255,22 @@ def main():
     if psnr_list:
         avg_psnr = np.mean(psnr_list)
         avg_ssim = np.mean(ssim_list)
+        avg_lpips = np.mean(lpips_list)
         print(f'\n===== FMB Evaluation Results =====')
         print(f'Number of images: {len(psnr_list)}')
-        print(f'Average PSNR: {avg_psnr:.2f} dB')
-        print(f'Average SSIM: {avg_ssim:.4f}')
+        print(f'Average PSNR:  {avg_psnr:.2f} dB')
+        print(f'Average SSIM:  {avg_ssim:.4f}')
+        print(f'Average LPIPS: {avg_lpips:.4f}')
 
         with open(output_dir / 'metrics.txt', 'w') as f:
             f.write(f'FMB Dataset Evaluation\n')
             f.write(f'Number of images: {len(psnr_list)}\n')
-            f.write(f'Average PSNR: {avg_psnr:.2f} dB\n')
-            f.write(f'Average SSIM: {avg_ssim:.4f}\n')
+            f.write(f'Average PSNR:  {avg_psnr:.2f} dB\n')
+            f.write(f'Average SSIM:  {avg_ssim:.4f}\n')
+            f.write(f'Average LPIPS: {avg_lpips:.4f}\n')
             f.write(f'\nPer-image results:\n')
-            for i, (p, s) in enumerate(zip(psnr_list, ssim_list)):
-                f.write(f'{lr_files[i].name}: PSNR={p:.2f}, SSIM={s:.4f}\n')
+            for i, (p, s, l) in enumerate(zip(psnr_list, ssim_list, lpips_list)):
+                f.write(f'{lr_files[i].name}: PSNR={p:.2f}, SSIM={s:.4f}, LPIPS={l:.4f}\n')
 
 
 if __name__ == '__main__':
