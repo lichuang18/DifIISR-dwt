@@ -120,16 +120,36 @@ def build_model(configs, ckpt_path, device):
     for param in model.parameters():
         param.requires_grad = False
 
+    # 构建DWT编码器（如果配置了）
+    dwt_encoder = None
+    if configs.get('dwt_encoder') is not None:
+        dwt_encoder = util_common.instantiate_from_config(configs.dwt_encoder).to(device)
+        dwt_encoder.eval()
+        print('Using DWT Encoder')
+        # 恢复dwt_encoder的可学习参数
+        if 'dwt_encoder' in ckpt:
+            dwt_encoder.load_state_dict(ckpt['dwt_encoder'])
+            print('Restored DWT Encoder parameters')
+
     autoencoder = None
     if configs.autoencoder is not None:
         autoencoder = util_common.instantiate_from_config(configs.autoencoder).to(device)
+        # 加载VAE预训练权重
+        ae_ckpt_path = configs.autoencoder.get('ckpt_path', None)
+        if ae_ckpt_path:
+            print(f'Loading AutoEncoder from {ae_ckpt_path}...')
+            ae_ckpt = torch.load(ae_ckpt_path, map_location=device)
+            if 'state_dict' in ae_ckpt:
+                util_net.reload_model(autoencoder, ae_ckpt['state_dict'])
+            else:
+                util_net.reload_model(autoencoder, ae_ckpt)
         autoencoder.eval()
 
-    return model, diffusion, autoencoder
+    return model, diffusion, autoencoder, dwt_encoder
 
 
 @torch.no_grad()
-def inference_single(model, diffusion, autoencoder, lr_img, device, configs):
+def inference_single(model, diffusion, autoencoder, lr_img, device, configs, dwt_encoder=None):
     """对单张LR图像进行超分，支持任意尺寸输入"""
     h, w = lr_img.shape[:2]
 
@@ -155,13 +175,14 @@ def inference_single(model, diffusion, autoencoder, lr_img, device, configs):
 
     model_kwargs = {'lq': lr_tensor} if configs.model.params.get('cond_lq', True) else {}
 
-    sr_tensor = diffusion.ddim_sample_loop(
+    sr_tensor = diffusion.p_sample_loop(
         y=lr_tensor,
         model=model,
         first_stage_model=autoencoder,
         clip_denoised=True if autoencoder is None else False,
         model_kwargs=model_kwargs,
         progress=False,
+        dwt_encoder=dwt_encoder,
     )
 
     sr_tensor = sr_tensor * 0.5 + 0.5
@@ -186,7 +207,7 @@ def main():
     print(f'Using device: {device}')
 
     configs = load_yaml_config(args.config)
-    model, diffusion, autoencoder = build_model(configs, args.ckpt, device)
+    model, diffusion, autoencoder, dwt_encoder = build_model(configs, args.ckpt, device)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +241,7 @@ def main():
         lr_img = np.array(Image.open(lr_path).convert('RGB')).astype(np.float32) / 255.0
 
         # 超分
-        sr_img = inference_single(model, diffusion, autoencoder, lr_img, device, configs)
+        sr_img = inference_single(model, diffusion, autoencoder, lr_img, device, configs, dwt_encoder=dwt_encoder)
 
         # 保存SR图像
         sr_path = output_dir / f'sr_{lr_path.stem}.png'

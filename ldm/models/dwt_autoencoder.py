@@ -925,6 +925,95 @@ class DWTModelAllBandsLearnableTorch(nn.Module):
         pass
 
 
+class DWTEncoderOnly(nn.Module):
+    """
+    仅DWT编码器 - 用于配合外部VAE Decoder
+
+    这个类只负责编码，解码由外部的VAE Decoder完成。
+    适用于：DWT编码 + UNet(21→3) + VAE解码 的架构。
+
+    数据流：
+      LR → DWT.encode → 64×64×21 → UNet(in=42,out=3) → 64×64×3 → VAE.decode → SR
+
+    编码: 256×256×3 → 64×64×21
+    投影: 21通道 → 3通道（用于送入VAE Decoder）
+    """
+    def __init__(self, wavelet='haar', level=2):
+        super().__init__()
+        self.wavelet = wavelet
+        self.level = level
+
+        # DWT编码器（无参数）
+        self.dwt = DWTForward(wavelet)
+
+        # 可学习的下采样：128→64（用于level1子带）
+        self.down = nn.Conv2d(9, 9, kernel_size=3, stride=2, padding=1, groups=9)
+
+        # 投影层：21通道 → 3通道（用于送入VAE Decoder）
+        self.proj = nn.Conv2d(21, 3, kernel_size=1, bias=True)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        # 初始化下采样卷积
+        with torch.no_grad():
+            nn.init.zeros_(self.down.weight)
+            for i in range(9):
+                self.down.weight[i, 0, 1, 1] = 1.0
+            if self.down.bias is not None:
+                nn.init.zeros_(self.down.bias)
+
+        # 初始化投影层 - 使用kaiming初始化
+        nn.init.kaiming_normal_(self.proj.weight, mode='fan_out', nonlinearity='linear')
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def encode(self, x):
+        """
+        DWT编码
+        输入: x [B, 3, 256, 256]
+        输出: z [B, 21, 64, 64]
+        """
+        # 第一级DWT: 256×256 → 128×128
+        LL1, (LH1, HL1, HH1) = self.dwt(x)
+
+        # 第二级DWT: 128×128 → 64×64
+        LL2, (LH2, HL2, HH2) = self.dwt(LL1)
+
+        # level2子带: [B, 12, 64, 64]
+        level2_bands = torch.cat([LL2, LH2, HL2, HH2], dim=1)
+
+        # level1子带: [B, 9, 128, 128] → [B, 9, 64, 64]
+        level1_bands = torch.cat([LH1, HL1, HH1], dim=1)
+        level1_down = self.down(level1_bands)
+
+        # 拼接: [B, 21, 64, 64]
+        z = torch.cat([level2_bands, level1_down], dim=1)
+
+        return z
+
+    def project(self, z):
+        """
+        投影层：将21通道DWT子带投影到3通道VAE潜空间
+        输入: z [B, 21, 64, 64]
+        输出: z_proj [B, 3, 64, 64]
+        """
+        return self.proj(z)
+
+    def decode(self, z):
+        """
+        这个类不负责解码，解码由外部VAE Decoder完成
+        这里只是为了接口兼容，直接返回输入
+        """
+        return z
+
+    def forward(self, x):
+        return self.encode(x)
+
+    def clear_cache(self):
+        pass
+
+
 # 测试代码
 if __name__ == '__main__':
     # 测试DWT模块

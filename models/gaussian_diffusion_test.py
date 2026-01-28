@@ -525,7 +525,8 @@ class GaussianDiffusion:
         device=None,
         progress=False,
         one_step=False,
-        apply_decoder=True
+        apply_decoder=True,
+        dwt_encoder=None
     ):
         """
         Generate samples from the model.
@@ -543,6 +544,7 @@ class GaussianDiffusion:
         :param device: if specified, the device to create the samples on.
                        If not specified, use a model parameter's device.
         :param progress: if True, show a tqdm progress bar.
+        :param dwt_encoder: if not None, use DWT encoder for encoding (DWT+VAE mode)
         :return: a non-differentiable batch of samples.
         """
         final = None
@@ -557,11 +559,12 @@ class GaussianDiffusion:
             model_kwargs=model_kwargs,
             device=device,
             progress=progress,
-            one_step=one_step
+            one_step=one_step,
+            dwt_encoder=dwt_encoder
         ):
             final = sample
         if apply_decoder:
-            return self.decode_first_stage(final["sample"], first_stage_model)
+            return self.decode_first_stage(final["sample"], first_stage_model, dwt_encoder=dwt_encoder)
         return final["sample"]
 
     def ddim_inverse_loop_progressive(
@@ -618,7 +621,8 @@ class GaussianDiffusion:
             model_kwargs=None,
             device=None,
             progress=False,
-            one_step=False
+            one_step=False,
+            dwt_encoder=None
     ):
         """
         Generate samples from the model and yield intermediate samples from
@@ -627,10 +631,18 @@ class GaussianDiffusion:
         Arguments are the same as p_sample_loop().
         Returns a generator over dicts, where each dict is the return value of
         p_sample().
+
+        :param dwt_encoder: if not None, use DWT encoder for encoding (DWT+VAE mode)
         """
         if device is None:
             device = next(model.parameters()).device
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+
+        # DWT+VAE模式：用DWT编码器编码LR图像
+        if dwt_encoder is not None:
+            z_y = self.encode_first_stage_dwt(y, dwt_encoder, up_sample=True)
+        else:
+            z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+
         #### z_y [1, 3, 128, 128]/[1, 3, 64, 64]
         # generating noise
         if noise is None:
@@ -670,30 +682,51 @@ class GaussianDiffusion:
                 yield out
                 z_sample = out["sample"]
 
-    def decode_first_stage(self, z_sample, first_stage_model=None, no_grad=True):
+    def decode_first_stage(self, z_sample, first_stage_model=None, no_grad=True, dwt_encoder=None):
+        """
+        解码潜空间到图像空间
+
+        支持三种模式：
+        1. 传统VAE模式：first_stage_model是VAE，直接decode
+        2. DWT+VAE模式：dwt_encoder有project方法，先投影21→3，再用VAE decode
+        3. 纯DWT模式：first_stage_model是DWT，直接decode（IDWT）
+        """
         ori_dtype = z_sample.dtype
         if first_stage_model is None:
             return z_sample
-        else:
-            if no_grad:
-                with th.no_grad():
-                    z_sample = 1 / self.scale_factor * z_sample
-                    # 检查模型是否有参数（DWT没有参数）
-                    try:
-                        model_dtype = next(first_stage_model.parameters()).dtype
-                        z_sample = z_sample.type(model_dtype)
-                    except StopIteration:
-                        pass
-                    out = first_stage_model.decode(z_sample)
+
+        def _decode(z):
+            z = 1 / self.scale_factor * z
+
+            # DWT+VAE模式：先用投影层将21通道转为3通道
+            if dwt_encoder is not None and hasattr(dwt_encoder, 'project'):
+                z = dwt_encoder.project(z)
+
+            # 检查模型是否有参数并转换dtype
+            try:
+                model_dtype = next(first_stage_model.parameters()).dtype
+                z = z.type(model_dtype)
+            except StopIteration:
+                pass
+
+            # 调用decode方法，检查是否支持force_not_quantize参数
+            if hasattr(first_stage_model, 'decode'):
+                import inspect
+                sig = inspect.signature(first_stage_model.decode)
+                if 'force_not_quantize' in sig.parameters:
+                    return first_stage_model.decode(z, force_not_quantize=True)
+                else:
+                    return first_stage_model.decode(z)
             else:
-                z_sample = 1 / self.scale_factor * z_sample
-                try:
-                    model_dtype = next(first_stage_model.parameters()).dtype
-                    z_sample = z_sample.type(model_dtype)
-                except StopIteration:
-                    pass
-                out = first_stage_model.decode(z_sample)
-            return out.type(ori_dtype)
+                return first_stage_model.decode(z)
+
+        if no_grad:
+            with th.no_grad():
+                out = _decode(z_sample)
+        else:
+            out = _decode(z_sample)
+
+        return out.type(ori_dtype)
 
     def encode_first_stage(self, y, first_stage_model, up_sample=False):
         ori_dtype = y.dtype
@@ -909,26 +942,35 @@ class GaussianDiffusion:
             first_stage_model=None,
             model_kwargs=None,
             noise=None,
+            dwt_encoder=None,
             ):
         """
         Compute training losses for a single timestep.
 
         :param model: the model to evaluate loss on.
-        :param first_stage_model: autoencoder model
+        :param first_stage_model: autoencoder model (or VAE decoder in DWT+VAE mode)
         :param x_start: the [N x C x ...] tensor of inputs.
         :param y: the [N x C x ...] tensor of degraded inputs.
         :param t: a batch of timestep indices.
         :param model_kwargs: if not None, a dict of extra keyword arguments to
             pass to the model. This can be used for conditioning.
         :param noise: if specified, the specific Gaussian noise to try to remove.
+        :param dwt_encoder: if not None, use DWT encoder for encoding (DWT+VAE mode)
         :return: a dict with the key "loss" containing a tensor of shape [N].
                  Some mean or variance settings may also have other keys.
         """
         if model_kwargs is None:
             model_kwargs = {}
 
-        z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
-        z_start = self.encode_first_stage(x_start, first_stage_model, up_sample=False)
+        # DWT+VAE模式：用DWT编码，用VAE解码
+        if dwt_encoder is not None:
+            # 用DWT编码器编码（输出21通道）
+            z_y = self.encode_first_stage_dwt(y, dwt_encoder, up_sample=True)
+            z_start = self.encode_first_stage_dwt(x_start, dwt_encoder, up_sample=False)
+        else:
+            # 传统模式：用同一个autoencoder编解码
+            z_y = self.encode_first_stage(y, first_stage_model, up_sample=True)
+            z_start = self.encode_first_stage(x_start, first_stage_model, up_sample=False)
 
         if noise is None:
             noise = th.randn_like(z_start)
@@ -943,18 +985,33 @@ class GaussianDiffusion:
         terms = {}
 
         model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
-        #if self.detection_guidance:
 
         if self.loss_type == LossType.MSE or self.loss_type == LossType.WEIGHTED_MSE:
-            # model_output = model(self._scale_input(z_t, t), t, **model_kwargs)
-            target = {
-                ModelMeanType.START_X: z_start,
-                ModelMeanType.RESIDUAL: z_y - z_start,
-                ModelMeanType.EPSILON: noise,
-                ModelMeanType.EPSILON_SCALE: noise*self.kappa*_extract_into_tensor(self.sqrt_etas, t, noise.shape),
-            }[self.model_mean_type]
-            assert model_output.shape == target.shape == z_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            # DWT+VAE模式：在DWT空间计算MSE，让DDIM采样正确工作
+            if dwt_encoder is not None:
+                if self.model_mean_type == ModelMeanType.START_X:
+                    # 在DWT空间计算MSE（主要loss，让DDIM采样正确）
+                    # model_output是21通道，z_start也是21通道
+                    assert model_output.shape == z_start.shape, f"Shape mismatch: {model_output.shape} vs {z_start.shape}"
+                    terms["mse"] = mean_flat((z_start - model_output) ** 2)
+                else:
+                    target = {
+                        ModelMeanType.RESIDUAL: z_y - z_start,
+                        ModelMeanType.EPSILON: noise,
+                        ModelMeanType.EPSILON_SCALE: noise*self.kappa*_extract_into_tensor(self.sqrt_etas, t, noise.shape),
+                    }[self.model_mean_type]
+                    assert model_output.shape == target.shape
+                    terms["mse"] = mean_flat((target - model_output) ** 2)
+            else:
+                target = {
+                    ModelMeanType.START_X: z_start,
+                    ModelMeanType.RESIDUAL: z_y - z_start,
+                    ModelMeanType.EPSILON: noise,
+                    ModelMeanType.EPSILON_SCALE: noise*self.kappa*_extract_into_tensor(self.sqrt_etas, t, noise.shape),
+                }[self.model_mean_type]
+                assert model_output.shape == target.shape == z_start.shape
+                terms["mse"] = mean_flat((target - model_output) ** 2)
+
             if self.model_mean_type == ModelMeanType.EPSILON_SCALE:
                 terms["mse"] /= (self.kappa**2 * _extract_into_tensor(self.etas, t, t.shape))
             if self.loss_type == LossType.WEIGHTED_MSE:
@@ -978,6 +1035,24 @@ class GaussianDiffusion:
             raise NotImplementedError(self.model_mean_type)
 
         return terms, z_t, pred_zstart
+
+    def encode_first_stage_dwt(self, y, dwt_encoder, up_sample=False):
+        """
+        使用DWT编码器编码图像
+
+        :param y: 输入图像 [B, 3, H, W]
+        :param dwt_encoder: DWT编码器
+        :param up_sample: 是否先上采样（用于LR图像）
+        :return: DWT编码后的潜空间 [B, 21, H/4, W/4]
+        """
+        ori_dtype = y.dtype
+        if up_sample:
+            y = F.interpolate(y, scale_factor=self.sf, mode='bicubic')
+
+        with th.no_grad():
+            z_y = dwt_encoder.encode(y)
+            out = z_y * self.scale_factor
+        return out.type(ori_dtype)
 
     def _scale_input(self, inputs, t):
         if self.normalize_input:

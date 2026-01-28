@@ -1,57 +1,62 @@
-测试 DWTModelAllBandsLearnableTorch 修复
-============================================================
-============================================================
-1. 测试权重形状
-============================================================
-self.down.weight.shape: torch.Size([9, 1, 3, 3])
-  期望: [9, 1, 3, 3] (groups=9 时第二维是1)
-self.up.weight.shape: torch.Size([9, 1, 4, 4])
-  期望: [9, 1, 4, 4] (groups=9 时第二维是1)
-✓ 权重形状正确
-
-============================================================
-5. 测试DWT/IDWT一致性（不经过可学习层）
-============================================================
-一级DWT+IDWT重建误差: 0.0000004768
-二级DWT+IDWT重建误差: 0.0000004768
-✓ DWT/IDWT完美可逆
-
-============================================================
-2. 测试编解码功能
-============================================================
-Input shape: torch.Size([2, 3, 256, 256])
-Latent shape: torch.Size([2, 21, 64, 64])
-Reconstructed shape: torch.Size([2, 3, 256, 256])
-Reconstruction error: 4.291489
-✗ 重建误差过大: 4.291489
-  可能原因: encode和decode的DWT/IDWT实现不一致
-
-============================================================
-3. 测试梯度回传
-============================================================
-self.up.weight.grad is not None: True
-self.down.weight.grad is not None: True
-self.up.weight.grad.abs().mean(): 0.000000
-self.down.weight.grad.abs().mean(): 0.000000
-✓ 梯度回传正常
-
-============================================================
-4. 测试初始化值
-============================================================
-down 卷积权重 (应该中心点为1):
-  通道 0: 中心值 = 1.0000
-  通道 1: 中心值 = 1.0000
-  通道 2: 中心值 = 1.0000
-
-up 反卷积权重 (应该接近双线性插值):
-  通道 0 的权重:
-tensor([[0.0625, 0.1250, 0.1250, 0.0625],
-        [0.1250, 0.2500, 0.2500, 0.1250],
-        [0.1250, 0.2500, 0.2500, 0.1250],
-        [0.0625, 0.1250, 0.1250, 0.0625]], grad_fn=<SelectBackward0>)
-
-✓ 初始化值正确
-
-============================================================
-所有测试完成!
-============================================================
+python eval_fmb.py --config configs/train_m3fd_dwt_vae_decoder.yaml --ckpt /home/lch/sr_recons/experiments/DifIISR_DWT_VAE_Decoder_20260128_212243/checkpoints/final.pth --output_dir results/half_fmb --num_image
+s 20
+Using device: cuda
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/functional.py:504: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3526.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Loading model from /home/lch/sr_recons/experiments/DifIISR_DWT_VAE_Decoder_20260128_212243/checkpoints/final.pth...
+building MemoryEfficientAttnBlock with 512 in_channels...
+Working with z of shape (1, 3, 64, 64) = 12288 dimensions.
+building MemoryEfficientAttnBlock with 512 in_channels...
+Processing 20 images...
+Loading LPIPS model...
+Setting up [LPIPS] perceptual loss: trunk [vgg], v[0.1], spatial [off]
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=VGG16_Weights.IMAGENET1K_V1`. You can also use `weights=VGG16_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Loading model from: /home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/lpips/weights/v0.1/vgg.pth
+Inference:   0%|                         | 0/20 [00:01<?, ?it/s]
+Traceback (most recent call last):
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 277, in <module>
+    main()
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 223, in main
+    sr_img = inference_single(model, diffusion, autoencoder, lr_img, device, configs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/eval_fmb.py", line 158, in inference_single
+    sr_tensor = diffusion.ddim_sample_loop(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1127, in ddim_sample_loop
+    for sample in self.ddim_sample_loop_progressive(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1192, in ddim_sample_loop_progressive
+    out = self.ddim_sample(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 1086, in ddim_sample
+    out = self.p_mean_variance(
+  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 44, in p_mean_variance
+    return super().p_mean_variance(self._wrap_model(model), *args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/gaussian_diffusion_test.py", line 264, in p_mean_variance
+    model_output = model(self._scale_input(x_t, t), t, **model_kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/respace.py", line 63, in __call__
+    return self.model(x, new_ts, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/unet.py", line 853, in forward
+    h = module(h, emb)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lch/sr_recons/DifIISR-dwt/models/unet.py", line 50, in forward
+    x = layer(x)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 460, in forward
+    return self._conv_forward(input, self.weight, self.bias)
+  File "/home/lch/miniconda3/envs/sr/lib/python3.10/site-packages/torch/nn/modules/conv.py", line 456, in _conv_forward
+    return F.conv2d(input, weight, bias, self.stride,
+RuntimeError: Given groups=1, weight of size [160, 42, 3, 3], expected input[1, 6, 192, 256] to have 42 channels, but got 6 channels instead

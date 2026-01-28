@@ -1,23 +1,28 @@
-# DifIISR-DWT 方案A配置 - 纯PyTorch版本，支持LPIPS梯度回传
+# DifIISR 最终方案：DWT编码 + UNet融合 + VAE解码
 #
-# 与 DWTModelAllBandsLearnable 的区别:
-#   - DWTModelAllBandsLearnable: decode使用pywt (numpy)，梯度断开，LPIPS无效
-#   - DWTModelAllBandsLearnableTorch: decode使用纯PyTorch，梯度可回传，LPIPS有效
+# 核心思路：
+#   - 编码：DWT (0参数，高效)
+#   - UNet：输入42通道(21+21)，输出21通道（在DWT空间扩散）
+#   - 解码：投影层(21→3) + 原版预训练VAE Decoder（有生成能力）
 #
-# 预期效果:
-#   - LPIPS损失可以有效训练 self.up 和 self.down 参数
-#   - 视觉质量更好（感知损失有效）
+# 数据流：
+#   LR → DWT.encode → 64×64×21 → UNet(in=42,out=21) → 64×64×21 → Proj(21→3) → VAE.decode → SR
+#
+# 收益：
+#   - Encoder参数：24.5M → 0 (-100%)
+#   - 编码计算量：57M MACs → 1M MACs (-98%)
+#   - 保留VAE Decoder的生成能力
 
-exp_name: DifIISR_DWT_Learnable_Torch
+exp_name: DifIISR_DWT_VAE_Decoder
 
 model:
   target: models.unet.UNetModelSwin
-  ckpt_path: ~  # 从头训练
+  ckpt_path: ~
   params:
     image_size: 64
-    in_channels: 42     # 21(噪声子带) + 21(LQ条件)
+    in_channels: 42     # 21(噪声DWT子带) + 21(LQ DWT子带)
     model_channels: 160
-    out_channels: 21    # 输出全部子带 (level2: 12 + level1: 9)
+    out_channels: 21    # 输出21通道，在DWT空间扩散
     cond_lq: True
     attention_resolutions: [64,32,16,8]
     dropout: 0
@@ -52,42 +57,54 @@ diffusion:
     normalize_input: True
     latent_flag: True
 
-# 使用纯PyTorch版本，支持LPIPS梯度回传
-autoencoder:
-  target: ldm.models.dwt_autoencoder.DWTModelAllBandsLearnableTorch
-  ckpt_path: ~
-  use_fp16: False
+# DWT编码器（只负责编码，输出21通道）
+dwt_encoder:
+  target: ldm.models.dwt_autoencoder.DWTEncoderOnly
   params:
     wavelet: haar
     level: 2
 
-# 感知损失配置 - 渐进式权重调度 + 时间步动态权重
-#
-# 渐进式权重调度策略:
-#   - 训练初期: lpips_weight_start=0.01, LPIPS贡献小, MSE主导
-#   - 训练后期: lpips_weight_end=0.15, LPIPS与MSE接近等权
-#   - 线性插值: weight = start + (end - start) * (iter / total)
-#
-# 时间步动态权重 (在train.py中实现):
-#   t < T/3:  权重 1.0 (pred质量好)
-#   T/3 <= t < 2T/3: 权重 0.1
-#   t >= 2T/3: 权重 0.001 (pred质量差)
-#
-# 预期效果 (total=100K, 典型LPIPS≈0.03加权后):
-#   0K:   weight=0.01, LPIPS贡献≈0.0003, MSE≈0.01  → 比例1:33 (MSE主导)
-#   50K:  weight=0.08, LPIPS贡献≈0.0024, MSE≈0.005 → 比例1:2
-#   100K: weight=0.15, LPIPS贡献≈0.0045, MSE≈0.005 → 比例1:1 (接近等权)
+# VAE解码器（使用原版预训练权重，只用decoder部分）
+autoencoder:
+  target: ldm.models.autoencoder.VQModelTorch
+  ckpt_path: weights/autoencoder_vq_f4.pth
+  use_fp16: False
+  params:
+    embed_dim: 3
+    n_embed: 8192
+    ddconfig:
+      double_z: False
+      z_channels: 3
+      resolution: 256
+      in_channels: 3
+      out_ch: 3
+      ch: 128
+      ch_mult:
+      - 1
+      - 2
+      - 4
+      num_res_blocks: 2
+      attn_resolutions: []
+      dropout: 0.0
+      padding_mode: zeros
+
+# 感知损失配置
 perceptual_loss:
   enabled: True
-  lpips_weight_start: 0.01   # 起始权重 (训练初期)
-  lpips_weight_end: 0.15     # 结束权重 (训练后期)
+  lpips_weight_start: 0.05
+  lpips_weight_end: 0.2
   lpips_net: 'vgg'
+
+  edge_loss_enabled: True
+  edge_loss_weight: 0.1
+
+  freq_loss_enabled: False
+  freq_loss_weight: 0.05
 
 # Real-ESRGAN风格退化配置
 degradation:
   sf: 4
 
-  # 第一阶段退化
   blur_kernel_size: 21
   kernel_list: ['iso', 'aniso', 'generalized_iso', 'generalized_aniso', 'plateau_iso', 'plateau_aniso']
   kernel_prob: [0.45, 0.25, 0.12, 0.03, 0.12, 0.03]
@@ -105,7 +122,6 @@ degradation:
 
   jpeg_range: [30, 95]
 
-  # 第二阶段退化
   second_order_prob: 0.5
   second_blur_prob: 0.8
 
@@ -134,18 +150,18 @@ data:
     scale: 4
     use_hflip: True
     use_rot: True
-    length: 2000 #~
+    length: ~
   val:
     hr_dir: /home/lch/sr_recons/dataset/M3FD_processed/val/HR
     length: 20
 
 train:
   output_dir: /home/lch/sr_recons/experiments
-  batch_size: 8
+  batch_size: 4
   val_batch_size: 4
   lr: 5e-5
   weight_decay: 0.01
-  iterations: 5000
+  iterations: 8000
   min_lr: 1e-6
 
   use_ema: True
@@ -153,7 +169,7 @@ train:
   use_scheduler: True
 
   log_freq: 100
-  val_freq: 1000
-  save_freq: 1000
+  val_freq: 500
+  save_freq: 2000
 
   num_workers: 4

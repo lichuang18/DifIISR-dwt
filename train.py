@@ -88,7 +88,16 @@ def build_model(configs, device):
         else:
             util_net.reload_model(model, ckpt)
 
-    # 构建autoencoder
+    # 构建DWT编码器（如果配置了）
+    dwt_encoder = None
+    if configs.get('dwt_encoder') is not None:
+        dwt_encoder = util_common.instantiate_from_config(configs.dwt_encoder).to(device)
+        logging.info('Using DWT Encoder')
+        # 统计DWT编码器参数
+        num_dwt_params = sum(p.numel() for p in dwt_encoder.parameters())
+        logging.info(f'DWT Encoder has {num_dwt_params} learnable parameters')
+
+    # 构建autoencoder (在DWT+VAE模式下，这是VAE Decoder)
     autoencoder = None
     if configs.autoencoder is not None:
         ckpt_path = configs.autoencoder.get('ckpt_path', None)
@@ -105,23 +114,30 @@ def build_model(configs, device):
         else:
             logging.info(f'Using AutoEncoder without pretrained weights (e.g., DWT)')
 
-        # 检查autoencoder是否有可学习参数
-        num_ae_params = sum(p.numel() for p in autoencoder.parameters())
-        if num_ae_params > 0:
-            # 有可学习参数（如DWTModelAllBandsLearnable），保持训练模式
-            logging.info(f'AutoEncoder has {num_ae_params} learnable parameters, keeping trainable')
-            autoencoder.train()
-        else:
-            # 无可学习参数（如DWTModelAllBands），冻结
-            logging.info(f'AutoEncoder has no learnable parameters, freezing')
+        # DWT+VAE模式：冻结VAE，只用decoder
+        if dwt_encoder is not None:
+            logging.info('DWT+VAE mode: freezing VAE, only using decoder')
             autoencoder.eval()
             for param in autoencoder.parameters():
                 param.requires_grad = False
+        else:
+            # 检查autoencoder是否有可学习参数
+            num_ae_params = sum(p.numel() for p in autoencoder.parameters())
+            if num_ae_params > 0:
+                # 有可学习参数（如DWTModelAllBandsLearnable），保持训练模式
+                logging.info(f'AutoEncoder has {num_ae_params} learnable parameters, keeping trainable')
+                autoencoder.train()
+            else:
+                # 无可学习参数（如DWTModelAllBands），冻结
+                logging.info(f'AutoEncoder has no learnable parameters, freezing')
+                autoencoder.eval()
+                for param in autoencoder.parameters():
+                    param.requires_grad = False
 
         if configs.autoencoder.get('use_fp16', False):
             autoencoder = autoencoder.half()
 
-    return model, diffusion, autoencoder
+    return model, diffusion, autoencoder, dwt_encoder
 
 
 def build_dataloader(configs):
@@ -317,7 +333,7 @@ class FFTFrequencyLoss(nn.Module):
 
 def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, configs,
                    lpips_fn=None, edge_loss_fn=None, freq_loss_fn=None,
-                   iteration=0, total_iterations=100000):
+                   iteration=0, total_iterations=100000, dwt_encoder=None):
     """训练一步"""
     model.train()
 
@@ -338,6 +354,7 @@ def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, conf
         t=t,
         first_stage_model=autoencoder,
         model_kwargs=model_kwargs,
+        dwt_encoder=dwt_encoder,
     )
 
     loss = losses['loss'].mean()
@@ -358,7 +375,7 @@ def train_one_step(model, diffusion, autoencoder, batch, optimizer, device, conf
 
     if need_decode and pred_zstart is not None:
         # 解码预测图像（只解码一次）
-        pred_img = diffusion.decode_first_stage(pred_zstart, autoencoder, no_grad=False)
+        pred_img = diffusion.decode_first_stage(pred_zstart, autoencoder, no_grad=False, dwt_encoder=dwt_encoder)
         pred_img = pred_img.clamp(-1, 1)
 
         # 时间步阈值（用于LPIPS动态权重）
@@ -469,7 +486,7 @@ def calculate_ssim_color(img1, img2):
 
 
 @torch.no_grad()
-def validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_fn=None):
+def validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_fn=None, dwt_encoder=None):
     """验证"""
     model.eval()
 
@@ -485,14 +502,15 @@ def validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_f
         # 使用DDIM采样
         model_kwargs = {'lq': lq} if configs.model.params.get('cond_lq', True) else {}
 
-        # 采样
-        sr = diffusion.ddim_sample_loop(
+        # 采样 - 使用p_sample_loop支持dwt_encoder
+        sr = diffusion.p_sample_loop(
             y=lq,
             model=model,
             first_stage_model=autoencoder,
             clip_denoised=True if autoencoder is None else False,
             model_kwargs=model_kwargs,
             progress=False,
+            dwt_encoder=dwt_encoder,
         )
 
         # 计算LPIPS（在[-1, 1]范围内计算）
@@ -530,7 +548,7 @@ def validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_f
     return {'psnr': avg_psnr, 'ssim': avg_ssim, 'lpips': avg_lpips}
 
 
-def save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder=None):
+def save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder=None, dwt_encoder=None):
     """保存检查点"""
     state = {
         'iteration': iteration,
@@ -546,6 +564,11 @@ def save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, auto
         ae_params = [p for p in autoencoder.parameters() if p.requires_grad]
         if ae_params:
             state['autoencoder'] = autoencoder.state_dict()
+    # 保存dwt_encoder的可学习参数（如果有）
+    if dwt_encoder is not None:
+        dwt_params = [p for p in dwt_encoder.parameters() if p.requires_grad]
+        if dwt_params:
+            state['dwt_encoder'] = dwt_encoder.state_dict()
 
     torch.save(state, save_path)
 
@@ -585,7 +608,7 @@ def main():
 
     # 构建模型
     logger.info('Building models...')
-    model, diffusion, autoencoder = build_model(configs, device)
+    model, diffusion, autoencoder, dwt_encoder = build_model(configs, device)
 
     # 统计参数量
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -599,17 +622,28 @@ def main():
             num_ae_params = sum(p.numel() for p in ae_trainable_params)
             logger.info(f'AutoEncoder trainable parameters: {num_ae_params}')
 
+    # 检查dwt_encoder是否有可学习参数
+    dwt_trainable_params = []
+    if dwt_encoder is not None:
+        dwt_trainable_params = [p for p in dwt_encoder.parameters() if p.requires_grad]
+        if dwt_trainable_params:
+            num_dwt_params = sum(p.numel() for p in dwt_trainable_params)
+            logger.info(f'DWT Encoder trainable parameters: {num_dwt_params}')
+
     # 构建EMA (只对UNet)
     ema = None
     if configs.train.get('use_ema', True):
         ema = LitEma(model, decay=float(configs.train.get('ema_rate', 0.999)))
         logger.info('Using EMA')
 
-    # 构建优化器 - 包含UNet和autoencoder的可学习参数
+    # 构建优化器 - 包含UNet、autoencoder和dwt_encoder的可学习参数
     params_to_optimize = list(model.parameters())
     if ae_trainable_params:
         params_to_optimize.extend(ae_trainable_params)
         logger.info('Including AutoEncoder parameters in optimizer')
+    if dwt_trainable_params:
+        params_to_optimize.extend(dwt_trainable_params)
+        logger.info('Including DWT Encoder parameters in optimizer')
 
     optimizer = torch.optim.AdamW(
         params_to_optimize,
@@ -649,6 +683,10 @@ def main():
         if 'autoencoder' in ckpt and autoencoder is not None:
             autoencoder.load_state_dict(ckpt['autoencoder'])
             logger.info('Restored AutoEncoder learnable parameters')
+        # 恢复dwt_encoder的可学习参数
+        if 'dwt_encoder' in ckpt and dwt_encoder is not None:
+            dwt_encoder.load_state_dict(ckpt['dwt_encoder'])
+            logger.info('Restored DWT Encoder learnable parameters')
         start_iter = ckpt['iteration']
 
     # 构建LPIPS损失函数
@@ -708,7 +746,8 @@ def main():
         train_metrics = train_one_step(
             model, diffusion, autoencoder, batch, optimizer, device, configs,
             lpips_fn=lpips_fn, edge_loss_fn=edge_loss_fn, freq_loss_fn=freq_loss_fn,
-            iteration=iteration, total_iterations=int(configs.train.iterations)
+            iteration=iteration, total_iterations=int(configs.train.iterations),
+            dwt_encoder=dwt_encoder
         )
 
         # 更新EMA
@@ -767,7 +806,7 @@ def main():
                 ema.store(list(model.parameters()))
                 ema.copy_to(model)
 
-            val_metrics = validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_fn=lpips_fn)
+            val_metrics = validate(model, diffusion, autoencoder, val_loader, device, configs, lpips_fn=lpips_fn, dwt_encoder=dwt_encoder)
 
             if ema is not None:
                 ema.restore(list(model.parameters()))
@@ -785,17 +824,17 @@ def main():
         # 保存检查点
         if iteration % int(configs.train.get('save_freq', 10000)) == 0:
             save_path = ckpt_dir / f'model_{iteration:06d}.pth'
-            save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder)
+            save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder, dwt_encoder)
             logger.info(f'Saved checkpoint to {save_path}')
 
             # 保存最新的检查点
-            save_checkpoint(model, ema, optimizer, scheduler, iteration, ckpt_dir / 'latest.pth', autoencoder)
+            save_checkpoint(model, ema, optimizer, scheduler, iteration, ckpt_dir / 'latest.pth', autoencoder, dwt_encoder)
 
     pbar.close()
 
     # 保存最终模型
     save_path = ckpt_dir / 'final.pth'
-    save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder)
+    save_checkpoint(model, ema, optimizer, scheduler, iteration, save_path, autoencoder, dwt_encoder)
     logger.info(f'Training finished. Final model saved to {save_path}')
 
     writer.close()
